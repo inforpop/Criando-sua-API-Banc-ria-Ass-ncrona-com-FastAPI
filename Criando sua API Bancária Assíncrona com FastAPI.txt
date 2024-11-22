@@ -1,0 +1,223 @@
+Criar uma API bancária assíncrona com **FastAPI** é uma excelente escolha, dado o suporte nativo para operações assíncronas, validação de dados com **Pydantic**, e facilidade de uso. Aqui está um guia passo a passo para criar uma API bancária simples que pode gerenciar contas, depósitos, saques e transferências.
+
+---
+
+### Passo 1: Instalação das dependências
+
+Antes de começar, instale as bibliotecas necessárias:
+
+```bash
+pip install fastapi uvicorn sqlalchemy databases
+```
+
+---
+
+### Passo 2: Configuração do banco de dados
+
+Usaremos **SQLAlchemy** e **Databases** para criar um banco de dados relacional assíncrono. Por exemplo, usando SQLite.
+
+#### Configuração inicial:
+
+```python
+# database.py
+from sqlalchemy import create_engine, MetaData
+from databases import Database
+
+DATABASE_URL = "sqlite+aiosqlite:///./bank.db"
+
+database = Database(DATABASE_URL)
+metadata = MetaData()
+
+engine = create_engine(DATABASE_URL)
+metadata.create_all(bind=engine)
+```
+
+---
+
+### Passo 3: Definição do modelo de dados
+
+Crie as tabelas para contas bancárias e transações:
+
+```python
+# models.py
+from sqlalchemy import Table, Column, Integer, String, Float, ForeignKey
+from sqlalchemy.orm import relationship
+from database import metadata
+
+# Tabela de contas
+accounts = Table(
+    "accounts",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("balance", Float, nullable=False, default=0.0),
+)
+
+# Tabela de transações
+transactions = Table(
+    "transactions",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("account_id", Integer, ForeignKey("accounts.id"), nullable=False),
+    Column("type", String, nullable=False),  # deposit, withdrawal, transfer
+    Column("amount", Float, nullable=False),
+)
+```
+
+---
+
+### Passo 4: Criar o aplicativo FastAPI
+
+#### Inicialize o aplicativo e conecte o banco de dados:
+
+```python
+# main.py
+from fastapi import FastAPI
+from database import database, metadata, engine
+
+app = FastAPI()
+
+# Inicializar banco de dados
+@app.on_event("startup")
+async def startup():
+    await database.connect()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
+```
+
+---
+
+### Passo 5: Criar as rotas da API
+
+#### Criação de conta:
+
+```python
+from fastapi import HTTPException
+from models import accounts
+from database import database
+
+@app.post("/accounts/")
+async def create_account(name: str, initial_balance: float = 0.0):
+    if initial_balance < 0:
+        raise HTTPException(status_code=400, detail="Initial balance cannot be negative")
+    query = accounts.insert().values(name=name, balance=initial_balance)
+    account_id = await database.execute(query)
+    return {"id": account_id, "name": name, "balance": initial_balance}
+```
+
+#### Consulta de conta:
+
+```python
+@app.get("/accounts/{account_id}")
+async def get_account(account_id: int):
+    query = accounts.select().where(accounts.c.id == account_id)
+    account = await database.fetch_one(query)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return account
+```
+
+#### Depósito:
+
+```python
+@app.post("/accounts/{account_id}/deposit/")
+async def deposit(account_id: int, amount: float):
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Deposit amount must be positive")
+
+    query = accounts.select().where(accounts.c.id == account_id)
+    account = await database.fetch_one(query)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    new_balance = account["balance"] + amount
+    update_query = accounts.update().where(accounts.c.id == account_id).values(balance=new_balance)
+    await database.execute(update_query)
+
+    return {"id": account_id, "new_balance": new_balance}
+```
+
+#### Saque:
+
+```python
+@app.post("/accounts/{account_id}/withdraw/")
+async def withdraw(account_id: int, amount: float):
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Withdrawal amount must be positive")
+
+    query = accounts.select().where(accounts.c.id == account_id)
+    account = await database.fetch_one(query)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    if account["balance"] < amount:
+        raise HTTPException(status_code=400, detail="Insufficient funds")
+
+    new_balance = account["balance"] - amount
+    update_query = accounts.update().where(accounts.c.id == account_id).values(balance=new_balance)
+    await database.execute(update_query)
+
+    return {"id": account_id, "new_balance": new_balance}
+```
+
+#### Transferência:
+
+```python
+@app.post("/accounts/transfer/")
+async def transfer(from_account_id: int, to_account_id: int, amount: float):
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Transfer amount must be positive")
+
+    # Obter contas
+    from_query = accounts.select().where(accounts.c.id == from_account_id)
+    from_account = await database.fetch_one(from_query)
+
+    to_query = accounts.select().where(accounts.c.id == to_account_id)
+    to_account = await database.fetch_one(to_query)
+
+    if not from_account or not to_account:
+        raise HTTPException(status_code=404, detail="One or both accounts not found")
+
+    if from_account["balance"] < amount:
+        raise HTTPException(status_code=400, detail="Insufficient funds")
+
+    # Atualizar saldos
+    new_from_balance = from_account["balance"] - amount
+    new_to_balance = to_account["balance"] + amount
+
+    await database.execute(
+        accounts.update().where(accounts.c.id == from_account_id).values(balance=new_from_balance)
+    )
+    await database.execute(
+        accounts.update().where(accounts.c.id == to_account_id).values(balance=new_to_balance)
+    )
+
+    return {
+        "from_account": {"id": from_account_id, "new_balance": new_from_balance},
+        "to_account": {"id": to_account_id, "new_balance": new_to_balance},
+    }
+```
+
+---
+
+### Passo 6: Rodar o servidor
+
+Execute o servidor com **Uvicorn**:
+
+```bash
+uvicorn main:app --reload
+```
+
+Acesse a documentação interativa em [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+
+---
+
+### Próximos passos
+
+1. **Autenticação**: Adicione autenticação JWT para proteger as rotas.
+2. **Logs e Monitoramento**: Use ferramentas como **Loguru** para logs e **Prometheus** para monitoramento.
+3. **Testes**: Escreva testes automatizados com **Pytest** para validar a API.
+
+Com isso, você tem uma API bancária funcional e extensível! 🎉
